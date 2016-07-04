@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"reflect"
 	"time"
 
 	elastic "gopkg.in/olivere/elastic.v3"
@@ -52,7 +53,7 @@ func main() {
 	if command == "create" && bulk {
 		duration, succeeded, failed = createByBatch(client)
 	} else if command == "create" {
-		panic("Not Implemented")
+		duration, succeeded, failed = createParallel(client)
 	} else if command == "search" {
 		panic("Not Implemented")
 	}
@@ -90,7 +91,106 @@ func createByBatch(client *elastic.Client) (duration time.Duration, succeeded in
 		succeeded = count
 		failed = 0
 	}
+	ensureWritten(client)
 	return
+}
+
+func createParallel(client *elastic.Client) (duration time.Duration, succeeded int, failed int) {
+	array := make([]map[string]string, count)
+	for i := 0; i < count; i++ {
+		array[i] = generateRecord()
+	}
+	inputs, outputs, errors := prepareChannels()
+
+	for i := 0; i < concurrency; i++ {
+		go createAsync(client, inputs[i], outputs[i], errors[i])
+	}
+	for i := 0; i < count; i++ {
+		inputs[i%concurrency] <- array[i]
+	}
+	for i := 0; i < concurrency; i++ {
+		close(inputs[i])
+	}
+	duration, succeeded, failed = waitForCases(outputs, errors)
+	ensureWritten(client)
+	return
+}
+
+func createAsync(client *elastic.Client, inputs <-chan map[string]string, outputs chan<- time.Duration, errors chan<- string) {
+	defer close(outputs)
+	defer close(errors)
+
+	for {
+		record, moreJob := <-inputs
+		if moreJob {
+			request := client.Index()
+			request.Id(generateUUID())
+			request.Index(indexName)
+			request.Type(typeName)
+			request.BodyJson(record)
+			request.OpType("create")
+			request.Timeout("60s")
+			beginTime := time.Now()
+			_, err := request.Do()
+			endTime := time.Now()
+			if err != nil {
+				errors <- err.Error()
+			} else {
+				outputs <- endTime.Sub(beginTime)
+			}
+		} else {
+			break
+		}
+	}
+}
+
+func prepareChannels() (inputs []chan map[string]string, outputs []chan time.Duration, errors []chan string) {
+	tasksPerChannel := 1 + (count-1)/concurrency
+
+	inputs = make([]chan map[string]string, concurrency)
+	outputs = make([]chan time.Duration, concurrency)
+	errors = make([]chan string, concurrency)
+	for i := 0; i < concurrency; i++ {
+		inputs[i] = make(chan map[string]string, tasksPerChannel)
+		outputs[i] = make(chan time.Duration, concurrency)
+		errors[i] = make(chan string, concurrency)
+	}
+	return
+}
+
+func waitForCases(outputs []chan time.Duration, errors []chan string) (durationSum time.Duration, succeed int, failed int) {
+	var done int
+
+	cases := make([]reflect.SelectCase, concurrency+concurrency)
+	for i := 0; i < concurrency; i++ {
+		cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(outputs[i])}
+	}
+	for i := 0; i < concurrency; i++ {
+		cases[i+concurrency] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(errors[i])}
+	}
+
+	durationSum = 0
+	succeed = 0
+	failed = 0
+	done = 0
+
+	for {
+		chosen, value, ok := reflect.Select(cases)
+		if ok {
+			if chosen < concurrency {
+				durationSum += time.Duration(value.Int())
+				succeed += 1
+			} else {
+				fmt.Fprintf(os.Stderr, "%d: %s\n", chosen-concurrency, value.String())
+				failed += 1
+			}
+		} else {
+			done += 1
+			if done >= count {
+				return
+			}
+		}
+	}
 }
 
 func parseFlags() {
@@ -143,6 +243,13 @@ func showElasticsearchInfo(client *elastic.Client) {
 		panic(err)
 	}
 	fmt.Printf("Name: %s, Cluster Name: %s Version: %s\n", pingResult.Name, pingResult.ClusterName, pingResult.Version.Number)
+}
+
+func ensureWritten(client *elastic.Client) {
+	_, err := client.Flush(indexName).WaitIfOngoing(true).Do()
+	if err != nil {
+		panic(err)
+	}
 }
 
 func ensureIndexExists(client *elastic.Client) {
