@@ -220,7 +220,6 @@ func waitForCases(outputs []chan time.Duration, errors []chan string) (durationS
 			if chosen < middle {
 				middle -= 1
 			}
-			fmt.Printf("existed: %d middle: %d\n", len(cases), middle)
 		}
 	}
 	return
