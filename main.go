@@ -12,15 +12,16 @@ import (
 )
 
 var (
-	command     string
-	url         string
-	maxRetries  int
-	indexName   string
-	typeName    string
-	bulk        bool
-	concurrency int
-	count       int
-	verbose     bool
+	command      string
+	url          string
+	maxRetries   int
+	indexName    string
+	typeName     string
+	bulk         bool
+	concurrency  int
+	count        int
+	verbose      bool
+	dataFilePath string
 )
 
 func main() {
@@ -44,6 +45,17 @@ func main() {
 	ensureIndexExists(client)
 	updateIndexMappings(client)
 
+	var datafile *os.File
+	if command == "create" {
+		datafile, err = os.OpenFile(dataFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	} else if command == "search" {
+		datafile, err = os.OpenFile(dataFilePath, os.O_RDONLY, 0)
+	}
+	if err != nil {
+		panic(err)
+	}
+	defer datafile.Close()
+
 	var (
 		duration  time.Duration
 		succeeded int
@@ -51,9 +63,9 @@ func main() {
 	)
 
 	if command == "create" && bulk {
-		duration, succeeded, failed = createByBatch(client)
+		duration, succeeded, failed = createByBatch(client, datafile)
 	} else if command == "create" {
-		duration, succeeded, failed = createParallel(client)
+		duration, succeeded, failed = createParallel(client, datafile)
 	} else if command == "search" {
 		panic("Not Implemented")
 	}
@@ -66,12 +78,16 @@ func main() {
 	}
 }
 
-func createByBatch(client *elastic.Client) (duration time.Duration, succeeded int, failed int) {
+func createByBatch(client *elastic.Client, datafile *os.File) (duration time.Duration, succeeded int, failed int) {
+	array := make([]map[string]string, count)
+	for i := 0; i < count; i++ {
+		array[i] = generateRecord()
+	}
 	bulk := client.Bulk().Index(indexName).Type(typeName)
 	for i := 0; i < count; i++ {
 		request := elastic.NewBulkIndexRequest()
 		request.Id(generateUUID())
-		request.Doc(generateRecord())
+		request.Doc(array[i])
 		request.OpType("create")
 		bulk.Add(request)
 	}
@@ -87,15 +103,30 @@ func createByBatch(client *elastic.Client) (duration time.Duration, succeeded in
 	} else if response.Errors {
 		succeeded = len(response.Succeeded())
 		failed = len(response.Failed())
+		for i, item := range response.Items {
+			result := item["index"]
+			if result != nil {
+				if result.Status >= 200 && result.Status <= 299 {
+					writeRecord(array[i], datafile)
+					succeeded += 1
+				} else {
+					failed += 1
+				}
+			}
+		}
+		ensureWritten(client)
 	} else {
+		for i := 0; i < count; i++ {
+			writeRecord(array[i], datafile)
+		}
+		ensureWritten(client)
 		succeeded = count
 		failed = 0
 	}
-	ensureWritten(client)
 	return
 }
 
-func createParallel(client *elastic.Client) (duration time.Duration, succeeded int, failed int) {
+func createParallel(client *elastic.Client, datafile *os.File) (duration time.Duration, succeeded int, failed int) {
 	array := make([]map[string]string, count)
 	for i := 0; i < count; i++ {
 		array[i] = generateRecord()
@@ -103,7 +134,7 @@ func createParallel(client *elastic.Client) (duration time.Duration, succeeded i
 	inputs, outputs, errors := prepareChannels()
 
 	for i := 0; i < concurrency; i++ {
-		go createAsync(client, inputs[i], outputs[i], errors[i])
+		go createAsync(client, inputs[i], outputs[i], errors[i], datafile)
 	}
 	for i := 0; i < count; i++ {
 		inputs[i%concurrency] <- array[i]
@@ -116,7 +147,7 @@ func createParallel(client *elastic.Client) (duration time.Duration, succeeded i
 	return
 }
 
-func createAsync(client *elastic.Client, inputs <-chan map[string]string, outputs chan<- time.Duration, errors chan<- string) {
+func createAsync(client *elastic.Client, inputs <-chan map[string]string, outputs chan<- time.Duration, errors chan<- string, datafile *os.File) {
 	defer close(outputs)
 	defer close(errors)
 
@@ -136,6 +167,7 @@ func createAsync(client *elastic.Client, inputs <-chan map[string]string, output
 			if err != nil {
 				errors <- err.Error()
 			} else {
+				writeRecord(record, datafile)
 				outputs <- endTime.Sub(beginTime)
 			}
 		} else {
@@ -202,6 +234,7 @@ func parseFlags() {
 	flag.IntVar(&count, "count", 1, "Count")
 	flag.IntVar(&concurrency, "concurrency", 1, "Concurrency")
 	flag.IntVar(&maxRetries, "max-retries", 10, "Elasticsearch Max Retries")
+	flag.StringVar(&dataFilePath, "datafile", "elasticrecords.txt", "Datafile")
 	flag.BoolVar(&verbose, "v", false, "Show Logs")
 	flag.Parse()
 
@@ -242,7 +275,7 @@ func showElasticsearchInfo(client *elastic.Client) {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Name: %s, Cluster Name: %s Version: %s\n", pingResult.Name, pingResult.ClusterName, pingResult.Version.Number)
+	fmt.Printf("Name: %s, Cluster Name: %s, Version: %s\n", pingResult.Name, pingResult.ClusterName, pingResult.Version.Number)
 }
 
 func ensureWritten(client *elastic.Client) {
