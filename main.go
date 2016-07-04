@@ -191,9 +191,8 @@ func prepareChannels() (inputs []chan map[string]string, outputs []chan time.Dur
 }
 
 func waitForCases(outputs []chan time.Duration, errors []chan string) (durationSum time.Duration, succeed int, failed int) {
-	var done int
-
-	cases := make([]reflect.SelectCase, concurrency+concurrency)
+	casesCount := concurrency + concurrency
+	cases := make([]reflect.SelectCase, casesCount)
 	for i := 0; i < concurrency; i++ {
 		cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(outputs[i])}
 	}
@@ -201,15 +200,15 @@ func waitForCases(outputs []chan time.Duration, errors []chan string) (durationS
 		cases[i+concurrency] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(errors[i])}
 	}
 
+	middle := concurrency
 	durationSum = 0
 	succeed = 0
 	failed = 0
-	done = 0
 
-	for {
+	for len(cases) > 0 {
 		chosen, value, ok := reflect.Select(cases)
 		if ok {
-			if chosen < concurrency {
+			if chosen < middle {
 				durationSum += time.Duration(value.Int())
 				succeed += 1
 			} else {
@@ -217,12 +216,14 @@ func waitForCases(outputs []chan time.Duration, errors []chan string) (durationS
 				failed += 1
 			}
 		} else {
-			done += 1
-			if done >= count {
-				return
+			cases = append(cases[:chosen], cases[chosen+1:]...)
+			if chosen < middle {
+				middle -= 1
 			}
+			fmt.Printf("existed: %d middle: %d\n", len(cases), middle)
 		}
 	}
+	return
 }
 
 func parseFlags() {
