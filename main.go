@@ -132,16 +132,16 @@ func createByBatch(client *elastic.Client, datafile *os.File) (duration time.Dur
 	cases := prepareCases(outputs, errors)
 
 	for i := 0; i < CommandArgs.Concurrency; i++ {
-		go bulkCreateAsync(inputs[i], outputs[i], errors[i])
+		go bulkCreateAsync(inputs, outputs[i], errors[i])
 	}
 
 	beginTime := time.Now()
-	for i, bulk := range bulks {
-		inputs[i%CommandArgs.Concurrency] <- bulk
-	}
-	for i := 0; i < CommandArgs.Concurrency; i++ {
-		close(inputs[i])
-	}
+	go func() {
+		for _, bulk := range bulks {
+			inputs <- bulk
+		}
+		close(inputs)
+	}()
 	_, succeededIdsLists, failed, failedMessages = waitForCases(cases, outputs, errors)
 	endTime := time.Now()
 	duration = endTime.Sub(beginTime)
@@ -195,16 +195,16 @@ func createParallel(client *elastic.Client, datafile *os.File) (duration time.Du
 	cases := prepareCases(outputs, errors)
 
 	for i := 0; i < CommandArgs.Concurrency; i++ {
-		go createAsync(inputs[i], outputs[i], errors[i])
+		go createAsync(inputs, outputs[i], errors[i])
 	}
 
 	beginTime := time.Now()
-	for i, request := range requests {
-		inputs[i%CommandArgs.Concurrency] <- request
-	}
-	for i := 0; i < CommandArgs.Concurrency; i++ {
-		close(inputs[i])
-	}
+	go func() {
+		for _, request := range requests {
+			inputs <- request
+		}
+		close(inputs)
+	}()
 	succeeded, succeededIds, failed, failedMessages = waitForCases(cases, outputs, errors)
 	endTime := time.Now()
 	duration = endTime.Sub(beginTime)
@@ -247,16 +247,16 @@ func searchParallel(client *elastic.Client, datafile *os.File) (duration time.Du
 	cases := prepareCases(outputs, errors)
 
 	for i := 0; i < CommandArgs.Concurrency; i++ {
-		go searchAsync(inputs[i], outputs[i], errors[i])
+		go searchAsync(inputs, outputs[i], errors[i])
 	}
 
 	beginTime := time.Now()
-	for i, request := range requests {
-		inputs[i%CommandArgs.Concurrency] <- request
-	}
-	for i := 0; i < CommandArgs.Concurrency; i++ {
-		close(inputs[i])
-	}
+	go func() {
+		for _, request := range requests {
+			inputs <- request
+		}
+		close(inputs)
+	}()
 	succeeded, succeededHits, failed, failedMessages = waitForCases(cases, outputs, errors)
 	endTime := time.Now()
 	duration = endTime.Sub(beginTime)
@@ -353,14 +353,11 @@ func searchAsync(inputs <-chan interface{}, outputs chan<- string, errors chan<-
 	}
 }
 
-func prepareChannels() (inputs []chan interface{}, outputs []chan string, errors []chan string) {
-	tasksPerChannel := 1 + (CommandArgs.Count-1)/CommandArgs.Concurrency
-
-	inputs = make([]chan interface{}, CommandArgs.Concurrency)
+func prepareChannels() (inputs chan interface{}, outputs []chan string, errors []chan string) {
+	inputs = make(chan interface{}, CommandArgs.Concurrency)
 	outputs = make([]chan string, CommandArgs.Concurrency)
 	errors = make([]chan string, CommandArgs.Concurrency)
 	for i := 0; i < CommandArgs.Concurrency; i++ {
-		inputs[i] = make(chan interface{}, tasksPerChannel)
 		outputs[i] = make(chan string, CommandArgs.Concurrency)
 		errors[i] = make(chan string, CommandArgs.Concurrency)
 	}
