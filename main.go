@@ -124,15 +124,17 @@ func createByBatch(client *elastic.Client, datafile *os.File) (duration time.Dur
 	for i := 0; i < CommandArgs.Concurrency; i++ {
 		close(inputs[i])
 	}
-	succeeded, succeededIdsLists, failed, failedMessages = waitForCases(cases, outputs, errors)
+	_, succeededIdsLists, failed, failedMessages = waitForCases(cases, outputs, errors)
 	endTime := time.Now()
 	duration = endTime.Sub(beginTime)
 
+	succeeded = 0
 	for _, succeededIdsList := range succeededIdsLists {
 		succeededIds := strings.Split(succeededIdsList, ",")
 		for _, succeededId := range succeededIds {
 			for i, id := range ids {
 				if id == succeededId {
+					succeeded += 1
 					writeRecord(records[i], datafile)
 					break
 				}
