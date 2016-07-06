@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"flag"
 	"fmt"
 	"log"
 	"math/rand"
@@ -13,29 +12,30 @@ import (
 	"strings"
 	"time"
 
+	flags "github.com/jessevdk/go-flags"
 	elastic "gopkg.in/olivere/elastic.v3"
 )
 
-var (
-	command      string
-	url          string
-	maxRetries   int
-	indexName    string
-	typeName     string
-	bulk         bool
-	concurrency  int
-	count        int
-	verbose      bool
-	dataFilePath string
-)
+var CommandArgs struct {
+	Url          string `long:"url" description:"Elasticsearch URL" required:"true"`
+	Index        string `long:"index" description:"Elasticsearch Index" required:"true"`
+	Type         string `long:"type" description:"Elasticsearch Type" required:"true"`
+	Command      string `long:"command" description:"Command ('create' or 'search')" required:"true"`
+	MaxRetries   int    `long:"max-retries" description:"Max Retries" default:"10"`
+	Bulk         int    `long:"bulk" description:"Bulk API count" default:"0"`
+	Concurrency  int    `long:"concurrency"  description:"Concurrency" default:"1"`
+	Count        int    `long:"count" description:"Count" default:"1"`
+	DataFilePath string `long:"datafile" description:"Data File Path" default:"elasticrecords.txt"`
+	Verbose      bool   `long:"verbose" description:"Show Elasticsearch API Calls"`
+}
 
 func main() {
 	parseFlags()
 
 	clientOpts := make([]elastic.ClientOptionFunc, 0, 4)
-	clientOpts = append(clientOpts, elastic.SetURL(url))
-	clientOpts = append(clientOpts, elastic.SetMaxRetries(maxRetries))
-	if verbose {
+	clientOpts = append(clientOpts, elastic.SetURL(CommandArgs.Url))
+	clientOpts = append(clientOpts, elastic.SetMaxRetries(CommandArgs.MaxRetries))
+	if CommandArgs.Verbose {
 		stdOutLogger := log.New(os.Stdout, "INFO: ", log.LstdFlags|log.Llongfile)
 		stdErrLogger := log.New(os.Stderr, "ERROR: ", log.LstdFlags|log.Llongfile)
 		clientOpts = append(clientOpts, elastic.SetInfoLog(stdOutLogger))
@@ -51,10 +51,10 @@ func main() {
 	updateIndexMappings(client)
 
 	var datafile *os.File
-	if command == "create" {
-		datafile, err = os.OpenFile(dataFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	} else if command == "search" {
-		datafile, err = os.OpenFile(dataFilePath, os.O_RDONLY, 0)
+	if CommandArgs.Command == "create" {
+		datafile, err = os.OpenFile(CommandArgs.DataFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	} else if CommandArgs.Command == "search" {
+		datafile, err = os.OpenFile(CommandArgs.DataFilePath, os.O_RDONLY, 0)
 	}
 	if err != nil {
 		panic(err)
@@ -67,16 +67,16 @@ func main() {
 		failed    int
 	)
 
-	if command == "create" && bulk {
+	if CommandArgs.Command == "create" && CommandArgs.Bulk > 0 {
 		duration, succeeded, failed = createByBatch(client, datafile)
-	} else if command == "create" {
+	} else if CommandArgs.Command == "create" {
 		duration, succeeded, failed = createParallel(client, datafile)
-	} else if command == "search" {
+	} else if CommandArgs.Command == "search" {
 		duration, succeeded, failed = searchParallel(client, datafile)
 	}
 
 	if failed > 0 {
-		fmt.Printf("Error percent: %f %%\n", float64(failed)*100.0/float64(count))
+		fmt.Printf("Error percent: %f %%\n", float64(failed)*100.0/float64(CommandArgs.Count))
 	}
 	if succeeded > 0 {
 		fmt.Printf("Benchmark: %f q/s\n", float64(succeeded*1e9)/float64(duration))
@@ -84,51 +84,65 @@ func main() {
 }
 
 func createByBatch(client *elastic.Client, datafile *os.File) (duration time.Duration, succeeded int, failed int) {
-	array := make([]map[string]string, count)
-	for i := 0; i < count; i++ {
-		array[i] = generateRecord()
+	var (
+		succeededIdsLists []string
+		failedMessages    []string
+	)
+	records := make([]map[string]string, CommandArgs.Count)
+	for i := 0; i < CommandArgs.Count; i++ {
+		records[i] = generateRecord()
 	}
-	bulk := client.Bulk().Index(indexName).Type(typeName)
-	for i := 0; i < count; i++ {
+
+	ids := make([]string, CommandArgs.Count)
+	for i := 0; i < CommandArgs.Count; i++ {
+		ids[i] = generateUUID()
+	}
+
+	bulkCount := 1 + (CommandArgs.Count-1)/CommandArgs.Bulk
+	bulks := make([]*elastic.BulkService, bulkCount)
+	for i := 0; i < bulkCount; i++ {
+		bulks[i] = client.Bulk().Index(CommandArgs.Index).Type(CommandArgs.Type)
+	}
+	for i := 0; i < CommandArgs.Count; i++ {
 		request := elastic.NewBulkIndexRequest()
-		request.Id(generateUUID())
-		request.Doc(array[i])
+		request.Id(ids[i])
+		request.Doc(records[i])
 		request.OpType("create")
-		bulk.Add(request)
+		bulks[i%bulkCount].Add(request)
+	}
+	inputs, outputs, errors := prepareChannels()
+	cases := prepareCases(outputs, errors)
+
+	for i := 0; i < CommandArgs.Concurrency; i++ {
+		go bulkCreateAsync(client, inputs[i], outputs[i], errors[i])
 	}
 
 	beginTime := time.Now()
-	response, err := bulk.Do()
+	for i, bulk := range bulks {
+		inputs[i%CommandArgs.Concurrency] <- bulk
+	}
+	for i := 0; i < CommandArgs.Concurrency; i++ {
+		close(inputs[i])
+	}
+	succeeded, succeededIdsLists, failed, failedMessages = waitForCases(cases, outputs, errors)
 	endTime := time.Now()
 	duration = endTime.Sub(beginTime)
 
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "createByBatch() Error: %s\n", err.Error())
-		succeeded = 0
-		failed = count
-	} else if response.Errors {
-		succeeded = len(response.Succeeded())
-		failed = len(response.Failed())
-		for i, item := range response.Items {
-			result := item["index"]
-			if result != nil {
-				if result.Status >= 200 && result.Status <= 299 {
-					writeRecord(array[i], datafile)
-					succeeded += 1
-				} else {
-					failed += 1
+	for _, succeededIdsList := range succeededIdsLists {
+		succeededIds := strings.Split(succeededIdsList, ",")
+		for _, succeededId := range succeededIds {
+			for i, id := range ids {
+				if id == succeededId {
+					writeRecord(records[i], datafile)
+					break
 				}
 			}
 		}
-		ensureWritten(client)
-	} else {
-		for i := 0; i < count; i++ {
-			writeRecord(array[i], datafile)
-		}
-		ensureWritten(client)
-		succeeded = count
-		failed = 0
 	}
+	for _, message := range failedMessages {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", message)
+	}
+
 	return
 }
 
@@ -137,20 +151,20 @@ func createParallel(client *elastic.Client, datafile *os.File) (duration time.Du
 		succeededIds   []string
 		failedMessages []string
 	)
-	ids := make([]string, count)
-	for i := 0; i < count; i++ {
+	ids := make([]string, CommandArgs.Count)
+	for i := 0; i < CommandArgs.Count; i++ {
 		ids[i] = generateUUID()
 	}
-	records := make([]map[string]string, count)
-	for i := 0; i < count; i++ {
+	records := make([]map[string]string, CommandArgs.Count)
+	for i := 0; i < CommandArgs.Count; i++ {
 		records[i] = generateRecord()
 	}
 
-	requests := make([]*elastic.IndexService, count)
-	for i := 0; i < count; i++ {
+	requests := make([]*elastic.IndexService, CommandArgs.Count)
+	for i := 0; i < CommandArgs.Count; i++ {
 		request := client.Index()
-		request.Index(indexName)
-		request.Type(typeName)
+		request.Index(CommandArgs.Index)
+		request.Type(CommandArgs.Type)
 		request.Id(ids[i])
 		request.BodyJson(records[i])
 		request.OpType("create")
@@ -160,15 +174,15 @@ func createParallel(client *elastic.Client, datafile *os.File) (duration time.Du
 	inputs, outputs, errors := prepareChannels()
 	cases := prepareCases(outputs, errors)
 
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < CommandArgs.Concurrency; i++ {
 		go createAsync(client, inputs[i], outputs[i], errors[i])
 	}
 
 	beginTime := time.Now()
 	for i, request := range requests {
-		inputs[i%concurrency] <- request
+		inputs[i%CommandArgs.Concurrency] <- request
 	}
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < CommandArgs.Concurrency; i++ {
 		close(inputs[i])
 	}
 	succeeded, succeededIds, failed, failedMessages = waitForCases(cases, outputs, errors)
@@ -196,31 +210,31 @@ func searchParallel(client *elastic.Client, datafile *os.File) (duration time.Du
 		succeededHits  []string
 		failedMessages []string
 	)
-	requests := make([]*elastic.SearchService, count)
-	for i := 0; i < count; i++ {
+	requests := make([]*elastic.SearchService, CommandArgs.Count)
+	for i := 0; i < CommandArgs.Count; i++ {
 		key, value, err := getLine(datafile)
 		if err != nil {
 			panic(err)
 		}
 
 		request := client.Search()
-		request.Index(indexName)
-		request.Type(typeName)
+		request.Index(CommandArgs.Index)
+		request.Type(CommandArgs.Type)
 		request.Query(elastic.NewTermQuery(key, value))
 		requests[i] = request
 	}
 	inputs, outputs, errors := prepareChannels()
 	cases := prepareCases(outputs, errors)
 
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < CommandArgs.Concurrency; i++ {
 		go searchAsync(client, inputs[i], outputs[i], errors[i])
 	}
 
 	beginTime := time.Now()
 	for i, request := range requests {
-		inputs[i%concurrency] <- request
+		inputs[i%CommandArgs.Concurrency] <- request
 	}
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < CommandArgs.Concurrency; i++ {
 		close(inputs[i])
 	}
 	succeeded, succeededHits, failed, failedMessages = waitForCases(cases, outputs, errors)
@@ -243,6 +257,34 @@ func searchParallel(client *elastic.Client, datafile *os.File) (duration time.Du
 	return
 }
 
+func bulkCreateAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan<- string, errors chan<- string) {
+	defer close(outputs)
+	defer close(errors)
+
+	for {
+		job, moreJob := <-inputs
+		if moreJob {
+			request, ok := job.(*elastic.BulkService)
+			if ok {
+				response, err := request.Do()
+				if err != nil {
+					errors <- err.Error()
+				} else {
+					succeededIds := make([]string, 0, response.Took)
+					for _, responseItem := range response.Succeeded() {
+						succeededIds = append(succeededIds, responseItem.Id)
+					}
+					outputs <- strings.Join(succeededIds, ",")
+				}
+			} else {
+				panic(fmt.Sprintf("Expected Type is *elastic.BulkService, but %T\n", request))
+			}
+		} else {
+			break
+		}
+	}
+}
+
 func createAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan<- string, errors chan<- string) {
 	defer close(outputs)
 	defer close(errors)
@@ -259,7 +301,7 @@ func createAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan
 					outputs <- response.Id
 				}
 			} else {
-				panic(fmt.Sprintf("Expect Job is *elastic.IndexService, but %T\n", request))
+				panic(fmt.Sprintf("Expected Type is *elastic.IndexService, but %T\n", request))
 			}
 		} else {
 			break
@@ -283,7 +325,7 @@ func searchAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan
 					outputs <- strconv.FormatInt(response.Hits.TotalHits, 10)
 				}
 			} else {
-				panic(fmt.Sprintf("Expect Job is *elastic.SearchService, but %T\n", request))
+				panic(fmt.Sprintf("Expected Type is *elastic.SearchService, but %T\n", request))
 			}
 		} else {
 			break
@@ -292,35 +334,35 @@ func searchAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan
 }
 
 func prepareChannels() (inputs []chan interface{}, outputs []chan string, errors []chan string) {
-	tasksPerChannel := 1 + (count-1)/concurrency
+	tasksPerChannel := 1 + (CommandArgs.Count-1)/CommandArgs.Concurrency
 
-	inputs = make([]chan interface{}, concurrency)
-	outputs = make([]chan string, concurrency)
-	errors = make([]chan string, concurrency)
-	for i := 0; i < concurrency; i++ {
+	inputs = make([]chan interface{}, CommandArgs.Concurrency)
+	outputs = make([]chan string, CommandArgs.Concurrency)
+	errors = make([]chan string, CommandArgs.Concurrency)
+	for i := 0; i < CommandArgs.Concurrency; i++ {
 		inputs[i] = make(chan interface{}, tasksPerChannel)
-		outputs[i] = make(chan string, concurrency)
-		errors[i] = make(chan string, concurrency)
+		outputs[i] = make(chan string, CommandArgs.Concurrency)
+		errors[i] = make(chan string, CommandArgs.Concurrency)
 	}
 	return
 }
 
 func prepareCases(outputs []chan string, errors []chan string) []reflect.SelectCase {
-	casesCount := concurrency + concurrency
+	casesCount := CommandArgs.Concurrency + CommandArgs.Concurrency
 	cases := make([]reflect.SelectCase, casesCount)
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < CommandArgs.Concurrency; i++ {
 		cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(outputs[i])}
 	}
-	for i := 0; i < concurrency; i++ {
-		cases[i+concurrency] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(errors[i])}
+	for i := 0; i < CommandArgs.Concurrency; i++ {
+		cases[i+CommandArgs.Concurrency] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(errors[i])}
 	}
 	return cases
 }
 
 func waitForCases(cases []reflect.SelectCase, outputs []chan string, errors []chan string) (succeeded int, succeededMessages []string, failed int, failedMessages []string) {
-	middle := concurrency
+	middle := CommandArgs.Concurrency
 	succeeded = 0
-	succeededMessages = make([]string, 0, count)
+	succeededMessages = make([]string, 0, CommandArgs.Count)
 	failed = 0
 	failedMessages = make([]string, 0)
 
@@ -345,52 +387,29 @@ func waitForCases(cases []reflect.SelectCase, outputs []chan string, errors []ch
 }
 
 func parseFlags() {
-	flag.StringVar(&url, "url", "http://localhost:9200", "Elasticsearch Url")
-	flag.StringVar(&indexName, "index", "", "Elasticsearch Index")
-	flag.StringVar(&typeName, "type", "", "Elasticsearch Type")
-	flag.StringVar(&command, "command", "", "Command ('create' or 'search')")
-	flag.BoolVar(&bulk, "bulk", false, "Use Bulk API")
-	flag.IntVar(&count, "count", 1, "Count")
-	flag.IntVar(&concurrency, "concurrency", 1, "Concurrency")
-	flag.IntVar(&maxRetries, "max-retries", 10, "Elasticsearch Max Retries")
-	flag.StringVar(&dataFilePath, "datafile", "elasticrecords.txt", "Datafile")
-	flag.BoolVar(&verbose, "v", false, "Show Logs")
-	flag.Parse()
-
-	if len(flag.Args()) > 0 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS]\n", os.Args[0])
-		flag.PrintDefaults()
+	_, err := flags.Parse(&CommandArgs)
+	if err != nil {
 		os.Exit(1)
 	}
 
-	if command != "create" && command != "search" {
+	if CommandArgs.Command != "create" && CommandArgs.Command != "search" {
 		fmt.Fprintf(os.Stderr, "Usage: -command must be `create` or `search`\n")
 		os.Exit(1)
 	}
 
-	if len(indexName) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: -index must be specified\n")
-		os.Exit(1)
-	}
-
-	if len(typeName) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: -type must be specified\n")
-		os.Exit(1)
-	}
-
-	if concurrency <= 0 {
+	if CommandArgs.Concurrency <= 0 {
 		fmt.Fprintf(os.Stderr, "Usage: -concurrency must be greater than 0\n")
 		os.Exit(1)
 	}
 
-	if count < concurrency {
+	if CommandArgs.Count < CommandArgs.Concurrency {
 		fmt.Fprintf(os.Stderr, "Usage: -count must be greater than or equal to -concurrency\n")
 		os.Exit(1)
 	}
 }
 
 func showElasticsearchInfo(client *elastic.Client) {
-	pingResult, _, err := client.Ping(url).Do()
+	pingResult, _, err := client.Ping(CommandArgs.Url).Do()
 	if err != nil {
 		panic(err)
 	}
@@ -398,20 +417,20 @@ func showElasticsearchInfo(client *elastic.Client) {
 }
 
 func ensureWritten(client *elastic.Client) {
-	_, err := client.Flush(indexName).WaitIfOngoing(true).Do()
+	_, err := client.Flush(CommandArgs.Index).WaitIfOngoing(true).Do()
 	if err != nil {
 		panic(err)
 	}
 }
 
 func ensureIndexExists(client *elastic.Client) {
-	indexExists, err := client.IndexExists(indexName).Do()
+	indexExists, err := client.IndexExists(CommandArgs.Index).Do()
 	if err != nil {
 		panic(err)
 	}
 
 	if !indexExists {
-		indexCreateResult, err := client.CreateIndex(indexName).Do()
+		indexCreateResult, err := client.CreateIndex(CommandArgs.Index).Do()
 		if err != nil {
 			panic(err)
 		}
@@ -556,7 +575,7 @@ var mappingsJson string = `
 `
 
 func updateIndexMappings(client *elastic.Client) {
-	response, err := client.PutMapping().Index(indexName).Type(typeName).BodyString(mappingsJson).Do()
+	response, err := client.PutMapping().Index(CommandArgs.Index).Type(CommandArgs.Type).BodyString(mappingsJson).Do()
 	if err != nil {
 		panic(err)
 	}
