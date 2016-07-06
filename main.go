@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
 	elastic "gopkg.in/olivere/elastic.v3"
@@ -67,14 +72,14 @@ func main() {
 	} else if command == "create" {
 		duration, succeeded, failed = createParallel(client, datafile)
 	} else if command == "search" {
-		panic("Not Implemented")
+		duration, succeeded, failed = searchParallel(client, datafile)
 	}
 
 	if failed > 0 {
 		fmt.Printf("Error percent: %f %%\n", float64(failed)*100.0/float64(count))
 	}
 	if succeeded > 0 {
-		fmt.Printf("Benchmark: %f q/s\n", float64(succeeded*10e9)/float64(duration))
+		fmt.Printf("Benchmark: %f q/s\n", float64(succeeded*1e9)/float64(duration))
 	}
 }
 
@@ -91,6 +96,7 @@ func createByBatch(client *elastic.Client, datafile *os.File) (duration time.Dur
 		request.OpType("create")
 		bulk.Add(request)
 	}
+
 	beginTime := time.Now()
 	response, err := bulk.Do()
 	endTime := time.Now()
@@ -127,48 +133,133 @@ func createByBatch(client *elastic.Client, datafile *os.File) (duration time.Dur
 }
 
 func createParallel(client *elastic.Client, datafile *os.File) (duration time.Duration, succeeded int, failed int) {
-	array := make([]map[string]string, count)
+	var (
+		succeededIds   []string
+		failedMessages []string
+	)
+	ids := make([]string, count)
 	for i := 0; i < count; i++ {
-		array[i] = generateRecord()
+		ids[i] = generateUUID()
+	}
+	records := make([]map[string]string, count)
+	for i := 0; i < count; i++ {
+		records[i] = generateRecord()
+	}
+
+	requests := make([]*elastic.IndexService, count)
+	for i := 0; i < count; i++ {
+		request := client.Index()
+		request.Index(indexName)
+		request.Type(typeName)
+		request.Id(ids[i])
+		request.BodyJson(records[i])
+		request.OpType("create")
+		request.Timeout("60s")
+		requests[i] = request
 	}
 	inputs, outputs, errors := prepareChannels()
+	cases := prepareCases(outputs, errors)
 
 	for i := 0; i < concurrency; i++ {
-		go createAsync(client, inputs[i], outputs[i], errors[i], datafile)
+		go createAsync(client, inputs[i], outputs[i], errors[i])
 	}
-	for i := 0; i < count; i++ {
-		inputs[i%concurrency] <- array[i]
+
+	beginTime := time.Now()
+	for i, request := range requests {
+		inputs[i%concurrency] <- request
 	}
 	for i := 0; i < concurrency; i++ {
 		close(inputs[i])
 	}
-	duration, succeeded, failed = waitForCases(outputs, errors)
+	succeeded, succeededIds, failed, failedMessages = waitForCases(cases, outputs, errors)
+	endTime := time.Now()
+	duration = endTime.Sub(beginTime)
+
+	for _, succeededId := range succeededIds {
+		for i, id := range ids {
+			if id == succeededId {
+				writeRecord(records[i], datafile)
+				break
+			}
+		}
+	}
+	for _, message := range failedMessages {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", message)
+	}
+
 	ensureWritten(client)
 	return
 }
 
-func createAsync(client *elastic.Client, inputs <-chan map[string]string, outputs chan<- time.Duration, errors chan<- string, datafile *os.File) {
+func searchParallel(client *elastic.Client, datafile *os.File) (duration time.Duration, succeeded int, failed int) {
+	var (
+		succeededHits  []string
+		failedMessages []string
+	)
+	requests := make([]*elastic.SearchService, count)
+	for i := 0; i < count; i++ {
+		key, value, err := getLine(datafile)
+		if err != nil {
+			panic(err)
+		}
+
+		request := client.Search()
+		request.Index(indexName)
+		request.Type(typeName)
+		request.Query(elastic.NewTermQuery(key, value))
+		requests[i] = request
+	}
+	inputs, outputs, errors := prepareChannels()
+	cases := prepareCases(outputs, errors)
+
+	for i := 0; i < concurrency; i++ {
+		go searchAsync(client, inputs[i], outputs[i], errors[i])
+	}
+
+	beginTime := time.Now()
+	for i, request := range requests {
+		inputs[i%concurrency] <- request
+	}
+	for i := 0; i < concurrency; i++ {
+		close(inputs[i])
+	}
+	succeeded, succeededHits, failed, failedMessages = waitForCases(cases, outputs, errors)
+	endTime := time.Now()
+	duration = endTime.Sub(beginTime)
+
+	for _, succeededHit := range succeededHits {
+		hit, err := strconv.ParseInt(succeededHit, 10, 64)
+		if err != nil {
+			panic(err)
+		}
+		if hit != 1 {
+			fmt.Fprintf(os.Stderr, "WARN: Expected Hit is 1, but %d\n", hit)
+		}
+	}
+
+	for _, message := range failedMessages {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", message)
+	}
+	return
+}
+
+func createAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan<- string, errors chan<- string) {
 	defer close(outputs)
 	defer close(errors)
 
 	for {
-		record, moreJob := <-inputs
+		job, moreJob := <-inputs
 		if moreJob {
-			request := client.Index()
-			request.Id(generateUUID())
-			request.Index(indexName)
-			request.Type(typeName)
-			request.BodyJson(record)
-			request.OpType("create")
-			request.Timeout("60s")
-			beginTime := time.Now()
-			_, err := request.Do()
-			endTime := time.Now()
-			if err != nil {
-				errors <- err.Error()
+			request, ok := job.(*elastic.IndexService)
+			if ok {
+				response, err := request.Do()
+				if err != nil {
+					errors <- err.Error()
+				} else {
+					outputs <- response.Id
+				}
 			} else {
-				writeRecord(record, datafile)
-				outputs <- endTime.Sub(beginTime)
+				panic(fmt.Sprintf("Expect Job is *elastic.IndexService, but %T\n", request))
 			}
 		} else {
 			break
@@ -176,21 +267,45 @@ func createAsync(client *elastic.Client, inputs <-chan map[string]string, output
 	}
 }
 
-func prepareChannels() (inputs []chan map[string]string, outputs []chan time.Duration, errors []chan string) {
+func searchAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan<- string, errors chan<- string) {
+	defer close(outputs)
+	defer close(errors)
+
+	for {
+		job, moreJob := <-inputs
+		if moreJob {
+			request, ok := job.(*elastic.SearchService)
+			if ok {
+				response, err := request.Do()
+				if err != nil {
+					errors <- err.Error()
+				} else {
+					outputs <- strconv.FormatInt(response.Hits.TotalHits, 10)
+				}
+			} else {
+				panic(fmt.Sprintf("Expect Job is *elastic.SearchService, but %T\n", request))
+			}
+		} else {
+			break
+		}
+	}
+}
+
+func prepareChannels() (inputs []chan interface{}, outputs []chan string, errors []chan string) {
 	tasksPerChannel := 1 + (count-1)/concurrency
 
-	inputs = make([]chan map[string]string, concurrency)
-	outputs = make([]chan time.Duration, concurrency)
+	inputs = make([]chan interface{}, concurrency)
+	outputs = make([]chan string, concurrency)
 	errors = make([]chan string, concurrency)
 	for i := 0; i < concurrency; i++ {
-		inputs[i] = make(chan map[string]string, tasksPerChannel)
-		outputs[i] = make(chan time.Duration, concurrency)
+		inputs[i] = make(chan interface{}, tasksPerChannel)
+		outputs[i] = make(chan string, concurrency)
 		errors[i] = make(chan string, concurrency)
 	}
 	return
 }
 
-func waitForCases(outputs []chan time.Duration, errors []chan string) (durationSum time.Duration, succeed int, failed int) {
+func prepareCases(outputs []chan string, errors []chan string) []reflect.SelectCase {
 	casesCount := concurrency + concurrency
 	cases := make([]reflect.SelectCase, casesCount)
 	for i := 0; i < concurrency; i++ {
@@ -199,20 +314,24 @@ func waitForCases(outputs []chan time.Duration, errors []chan string) (durationS
 	for i := 0; i < concurrency; i++ {
 		cases[i+concurrency] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(errors[i])}
 	}
+	return cases
+}
 
+func waitForCases(cases []reflect.SelectCase, outputs []chan string, errors []chan string) (succeeded int, succeededMessages []string, failed int, failedMessages []string) {
 	middle := concurrency
-	durationSum = 0
-	succeed = 0
+	succeeded = 0
+	succeededMessages = make([]string, 0, count)
 	failed = 0
+	failedMessages = make([]string, 0)
 
 	for len(cases) > 0 {
 		chosen, value, ok := reflect.Select(cases)
 		if ok {
 			if chosen < middle {
-				durationSum += time.Duration(value.Int())
-				succeed += 1
+				succeededMessages = append(succeededMessages, value.String())
+				succeeded += 1
 			} else {
-				fmt.Fprintf(os.Stderr, "%d: %s\n", chosen-concurrency, value.String())
+				failedMessages = append(failedMessages, value.String())
 				failed += 1
 			}
 		} else {
@@ -244,7 +363,7 @@ func parseFlags() {
 		os.Exit(1)
 	}
 
-	if command != "create" && command != "query" {
+	if command != "create" && command != "search" {
 		fmt.Fprintf(os.Stderr, "Usage: -command must be `create` or `search`\n")
 		os.Exit(1)
 	}
@@ -300,6 +419,49 @@ func ensureIndexExists(client *elastic.Client) {
 			fmt.Fprintf(os.Stderr, "createIndex() cannot be acknowledged\n")
 			os.Exit(1)
 		}
+	}
+}
+
+func getLine(datafile *os.File) (string, string, error) {
+	var (
+		stat    os.FileInfo
+		size    int64
+		buf     []byte = make([]byte, 300)
+		lineBuf []byte
+		line    string
+		results []string
+		err     error
+	)
+	stat, err = datafile.Stat()
+	if err != nil {
+		return "", "", err
+	}
+	size = stat.Size()
+	for {
+		_, err = datafile.ReadAt(buf, rand.Int63n(size))
+		if err != nil {
+			return "", "", err
+		}
+		bytesReader := bytes.NewReader(buf)
+		bufReader := bufio.NewReader(bytesReader)
+		lineBuf, _, err = bufReader.ReadLine()
+		if err != nil {
+			continue
+		}
+		line = string(lineBuf[:])
+		results = strings.SplitN(line, ":", 3)
+		if len(results) != 3 || len(results[2]) != 128 {
+			lineBuf, _, err = bufReader.ReadLine()
+			if err != nil {
+				continue
+			}
+			line = string(lineBuf[:])
+			results = strings.SplitN(line, ":", 3)
+			if len(results) != 3 || len(results[2]) != 128 {
+				continue
+			}
+		}
+		return "data" + results[1], results[2], err
 	}
 }
 
