@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
+	"net/http"
 	"os"
 	"reflect"
 	"strconv"
@@ -17,36 +19,52 @@ import (
 )
 
 var CommandArgs struct {
-	Url          string `long:"url" description:"Elasticsearch URL" required:"true"`
-	Index        string `long:"index" description:"Elasticsearch Index" required:"true"`
-	Type         string `long:"type" description:"Elasticsearch Type" required:"true"`
-	Command      string `long:"command" description:"Command ('create' or 'search')" required:"true"`
-	MaxRetries   int    `long:"max-retries" description:"Max Retries" default:"10"`
-	Bulk         int    `long:"bulk" description:"Bulk API count" default:"0"`
-	Concurrency  int    `long:"concurrency"  description:"Concurrency" default:"1"`
-	Count        int    `long:"count" description:"Count" default:"1"`
-	DataFilePath string `long:"datafile" description:"Data File Path" default:"elasticrecords.txt"`
-	Verbose      bool   `long:"verbose" description:"Show Elasticsearch API Calls"`
+	Urls         []string `long:"url" description:"Elasticsearch URL" required:"true"`
+	Index        string   `long:"index" description:"Elasticsearch Index" required:"true"`
+	Type         string   `long:"type" description:"Elasticsearch Type" required:"true"`
+	Command      string   `long:"command" description:"Command ('create' or 'search')" required:"true"`
+	MaxRetries   int      `long:"max-retries" description:"Max Retries" default:"1"`
+	Bulk         int      `long:"bulk" description:"Bulk API count" default:"0"`
+	Concurrency  int      `long:"concurrency"  description:"Concurrency" default:"1"`
+	Count        int      `long:"count" description:"Count" default:"1"`
+	DataFilePath string   `long:"datafile" description:"Data File Path" default:"elasticrecords.txt"`
+	Sniff        bool     `long:"sniff" description:"Enable Elasticsearch Sniffer"`
+	Verbose      bool     `long:"verbose" description:"Show Elasticsearch API Calls"`
+	Trace        bool     `long:"trace" description:"Show Elasticsearch API Calls Details"`
 }
 
 func main() {
 	parseFlags()
 
+	transport := &http.Transport{
+		Proxy:               nil,
+		Dial:                (&net.Dialer{Timeout: 1 * time.Minute, KeepAlive: 30 * time.Minute}).Dial,
+		MaxIdleConnsPerHost: CommandArgs.Concurrency * 5,
+	}
+	httpClient := http.Client{Transport: transport, Timeout: time.Duration(5 * time.Minute)}
+
 	clientOpts := make([]elastic.ClientOptionFunc, 0, 4)
-	clientOpts = append(clientOpts, elastic.SetURL(CommandArgs.Url))
+	clientOpts = append(clientOpts, elastic.SetURL(CommandArgs.Urls...))
 	clientOpts = append(clientOpts, elastic.SetMaxRetries(CommandArgs.MaxRetries))
+	clientOpts = append(clientOpts, elastic.SetSniff(CommandArgs.Sniff))
+	clientOpts = append(clientOpts, elastic.SetHttpClient(&httpClient))
+	stdOutLogger := log.New(os.Stdout, "INFO: ", log.LstdFlags|log.Llongfile)
+	stdErrLogger := log.New(os.Stderr, "ERROR: ", log.LstdFlags|log.Llongfile)
 	if CommandArgs.Verbose {
-		stdOutLogger := log.New(os.Stdout, "INFO: ", log.LstdFlags|log.Llongfile)
-		stdErrLogger := log.New(os.Stderr, "ERROR: ", log.LstdFlags|log.Llongfile)
 		clientOpts = append(clientOpts, elastic.SetInfoLog(stdOutLogger))
 		clientOpts = append(clientOpts, elastic.SetErrorLog(stdErrLogger))
+	}
+	if CommandArgs.Trace {
+		clientOpts = append(clientOpts, elastic.SetTraceLog(stdOutLogger))
 	}
 
 	client, err := elastic.NewClient(clientOpts...)
 	if err != nil {
 		panic(err)
 	}
-	showElasticsearchInfo(client)
+	for _, url := range CommandArgs.Urls {
+		showElasticsearchInfo(client, url)
+	}
 	ensureIndexExists(client)
 	updateIndexMappings(client)
 
@@ -114,7 +132,7 @@ func createByBatch(client *elastic.Client, datafile *os.File) (duration time.Dur
 	cases := prepareCases(outputs, errors)
 
 	for i := 0; i < CommandArgs.Concurrency; i++ {
-		go bulkCreateAsync(client, inputs[i], outputs[i], errors[i])
+		go bulkCreateAsync(inputs[i], outputs[i], errors[i])
 	}
 
 	beginTime := time.Now()
@@ -177,7 +195,7 @@ func createParallel(client *elastic.Client, datafile *os.File) (duration time.Du
 	cases := prepareCases(outputs, errors)
 
 	for i := 0; i < CommandArgs.Concurrency; i++ {
-		go createAsync(client, inputs[i], outputs[i], errors[i])
+		go createAsync(inputs[i], outputs[i], errors[i])
 	}
 
 	beginTime := time.Now()
@@ -229,7 +247,7 @@ func searchParallel(client *elastic.Client, datafile *os.File) (duration time.Du
 	cases := prepareCases(outputs, errors)
 
 	for i := 0; i < CommandArgs.Concurrency; i++ {
-		go searchAsync(client, inputs[i], outputs[i], errors[i])
+		go searchAsync(inputs[i], outputs[i], errors[i])
 	}
 
 	beginTime := time.Now()
@@ -259,7 +277,7 @@ func searchParallel(client *elastic.Client, datafile *os.File) (duration time.Du
 	return
 }
 
-func bulkCreateAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan<- string, errors chan<- string) {
+func bulkCreateAsync(inputs <-chan interface{}, outputs chan<- string, errors chan<- string) {
 	defer close(outputs)
 	defer close(errors)
 
@@ -287,7 +305,7 @@ func bulkCreateAsync(client *elastic.Client, inputs <-chan interface{}, outputs 
 	}
 }
 
-func createAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan<- string, errors chan<- string) {
+func createAsync(inputs <-chan interface{}, outputs chan<- string, errors chan<- string) {
 	defer close(outputs)
 	defer close(errors)
 
@@ -311,7 +329,7 @@ func createAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan
 	}
 }
 
-func searchAsync(client *elastic.Client, inputs <-chan interface{}, outputs chan<- string, errors chan<- string) {
+func searchAsync(inputs <-chan interface{}, outputs chan<- string, errors chan<- string) {
 	defer close(outputs)
 	defer close(errors)
 
@@ -410,8 +428,8 @@ func parseFlags() {
 	}
 }
 
-func showElasticsearchInfo(client *elastic.Client) {
-	pingResult, _, err := client.Ping(CommandArgs.Url).Do()
+func showElasticsearchInfo(client *elastic.Client, url string) {
+	pingResult, _, err := client.Ping(url).Do()
 	if err != nil {
 		panic(err)
 	}
