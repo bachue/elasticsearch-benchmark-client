@@ -24,4 +24,4 @@ _testmain.go
 *.prof
 
 /elasticsearch-benchmark-client
-/elasticrecords.txt
+/elasticrecords.data
