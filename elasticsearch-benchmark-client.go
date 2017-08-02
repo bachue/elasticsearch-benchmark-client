@@ -16,7 +16,7 @@ import (
 	flags "github.com/jessevdk/go-flags"
 	"github.com/pborman/uuid"
 	"github.com/spaolacci/murmur3"
-	elastic "gopkg.in/olivere/elastic.v3"
+	elastic "github.com/olivere/elastic"
 )
 
 var CommandArgs struct {

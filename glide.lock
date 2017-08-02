@@ -1,0 +1,17 @@
+hash: eb215fe0ec67e2a32dfd3845bfce0c9b0d0b5046c0596063b412bcd29c38f21c
+updated: 2016-08-26T16:10:21.063506457Z
+imports:
+- name: github.com/jessevdk/go-flags
+  version: 01a6b3ff72f9b826af6791c3b87368c7791b5376
+- name: github.com/olivere/elastic
+  version: 908ffee99d2c7e5fc7cf6ddf437b1fb26f4bb286
+- name: github.com/pborman/uuid
+  version: b984ec7fa9ff9e428bd0cf0abf429384dfbe3e37
+- name: github.com/spaolacci/murmur3
+  version: 0d12bf811670bf6a1a63828dfbd003eded177fce
+- name: gopkg.in/olivere/elastic.v3
+  version: 908ffee99d2c7e5fc7cf6ddf437b1fb26f4bb286
+  subpackages:
+  - backoff
+  - uritemplates
+testImports: []
